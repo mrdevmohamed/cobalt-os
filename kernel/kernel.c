@@ -1,5 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+#include "../games/games.h"
 
 enum { WIDTH = 800, HEIGHT = 600, COLS = 88, ROWS = 23, INPUT_MAX = 79 };
 enum { BG = 0x101b2d, PANEL = 0x1c2b43, INK = 0xe5edf8,
@@ -14,12 +16,6 @@ static inline uint8_t inb(uint16_t port) {
     return value;
 }
 static void debug(const char *s) { while (*s) outb(0xe9, (uint8_t)*s++); }
-static size_t length(const char *s) { size_t n = 0; while (s[n]) ++n; return n; }
-static int equal(const char *a, const char *b) {
-    while (*a && *a == *b) { ++a; ++b; }
-    return *a == *b;
-}
-static void copy(char *dst, const char *src) { while ((*dst++ = *src++)) {} }
 static char *decimal(char *dst, uint32_t value) {
     char digits[10];
     unsigned n = 0;
@@ -63,6 +59,8 @@ static volatile uint8_t *framebuffer;
 static unsigned pitch;
 static uint32_t foreground = INK;
 static int window_x = 32, window_y = 72, visible = 1;
+static int game_active, game_paused, game_suspended;
+static enum game_kind current_game;
 static int mouse_x = 680, mouse_y = 500, mouse_present, cursor_visible;
 static uint32_t cursor_under[12 * 18];
 
@@ -88,6 +86,20 @@ static void glyph(int x, int y, unsigned char c, uint32_t color) {
 static void text(int x, int y, const char *s, uint32_t color) {
     while (*s) { glyph(x, y, (unsigned char)*s++, color); x += 8; }
 }
+static const struct game_canvas game_canvas = {rect, text};
+static void window_visibility(int show) {
+    if (game_active && show != visible) {
+        if (!show) {
+            games_key(GAME_UP, 0); games_key(GAME_DOWN, 0);
+            games_key(GAME_LEFT, 0); games_key(GAME_RIGHT, 0);
+            game_suspended = !game_paused;
+            if (game_suspended) games_key(GAME_PAUSE, 1);
+        } else if (game_suspended) {
+            games_key(GAME_PAUSE, 1); game_suspended = 0;
+        }
+    }
+    visible = show;
+}
 static void cursor_hide(void) {
     if (!cursor_visible) return;
     for (int y = 0; y < 18; ++y)
@@ -110,16 +122,14 @@ static char lines[ROWS][COLS];
 static unsigned row, column;
 static int caret_on = 1;
 static void terminal_clear(void) {
-    for (unsigned y = 0; y < ROWS; ++y)
-        for (unsigned x = 0; x < COLS; ++x) lines[y][x] = ' ';
+    memset(lines, ' ', sizeof(lines));
     row = column = 0;
 }
 static void newline(void) {
     column = 0;
     if (++row < ROWS) return;
-    for (unsigned y = 1; y < ROWS; ++y)
-        for (unsigned x = 0; x < COLS; ++x) lines[y - 1][x] = lines[y][x];
-    for (unsigned x = 0; x < COLS; ++x) lines[ROWS - 1][x] = ' ';
+    memmove(lines[0], lines[1], sizeof(lines) - sizeof(lines[0]));
+    memset(lines[ROWS - 1], ' ', sizeof(lines[0]));
     row = ROWS - 1;
 }
 static void put(char c) {
@@ -133,6 +143,7 @@ static void number(uint32_t n) { char s[11]; decimal(s, n); print(s); }
 static void prompt(void) { print("cobalt> "); }
 static void terminal_draw(void) {
     if (!visible) return;
+    if (game_active) { games_draw(window_x + 16, window_y + 44, &game_canvas); return; }
     rect(window_x + 16, window_y + 44, COLS * 8, ROWS * 16, TERM);
     for (unsigned y = 0; y < ROWS; ++y)
         for (unsigned x = 0; x < COLS; ++x)
@@ -149,7 +160,7 @@ static void clock_draw(void) {
     *p++ = (char)('0' + seconds / 60 % 10); *p++ = ':';
     *p++ = (char)('0' + seconds % 60 / 10); *p++ = (char)('0' + seconds % 10); *p = 0;
     rect(616, 12, 184, 16, BG);
-    text(792 - (int)length(clock) * 8, 12, clock, MUTED);
+    text(792 - (int)strlen(clock) * 8, 12, clock, MUTED);
 }
 static void desktop_draw(void) {
     rect(0, 0, WIDTH, HEIGHT, BG);
@@ -167,10 +178,13 @@ static void desktop_draw(void) {
         rect(window_x, window_y, 736, 456, TERM);
         rect(window_x, window_y, 736, 32, PANEL);
         rect(window_x, window_y, 4, 32, ACCENT);
-        text(window_x + 16, window_y + 8, "TERMINAL / cobalt", INK);
+        text(window_x + 16, window_y + 8, game_active ?
+             (current_game == GAME_2048 ? "2048 / C PORT" : "PONG / C PORT") : "TERMINAL / cobalt", INK);
         text(window_x + 704, window_y + 8, "_", ACCENT);
         rect(window_x + 16, window_y + 422, 704, 1, PANEL);
-        text(window_x + 16, window_y + 432, "PS/2 keyboard  |  ROM files  |  type help", MUTED);
+        text(window_x + 16, window_y + 432, game_active ?
+             "Arrows/WASD move | P pause | R restart | Esc terminal" :
+             "PS/2 keyboard | ROM files | help | games", MUTED);
         terminal_draw();
     }
     clock_draw();
@@ -212,9 +226,11 @@ static const struct rom_file { const char *name, *contents; } files[] = {
      "The taskbar restores it. Files are compiled-in, read-only ROM data.\n"
      "No processes, writable disk filesystem, networking or protection yet.\n"},
     {"COMMANDS.TXT", "help clear about version echo uptime mem date ls cat color\n"
-     "history reboot shutdown halt\n"
+     "history games 2048 pong reboot shutdown halt\n"
      "color accepts: white green amber. cat requires an exact ROM filename.\n"
-     "Up/Down: command history. Ctrl+L: clear. Ctrl+C: cancel. F1: help.\n"}
+     "Up/Down: command history. Ctrl+L: clear. Ctrl+C: cancel. F1: help.\n"
+     "games: list ports. 2048/pong: launch. Arrows/WASD: game movement.\n"
+     "P: pause, R: restart, Esc: terminal. Scores are not saved.\n"}
 };
 static char input[INPUT_MAX + 1], history[8][INPUT_MAX + 1], draft[INPUT_MAX + 1];
 static unsigned input_length, history_count, history_next, history_offset;
@@ -229,6 +245,7 @@ static void help(void) {
           "  ls / cat FILE     Read built-in ROM files\n"
           "  color NAME        white, green, amber\n"
           "  history           Show recent commands\n"
+          "  games / 2048 / pong List / launch game ports\n"
           "  reboot            Restart machine\n"
           "  shutdown / halt   QEMU power off / stop CPU\n");
 }
@@ -261,56 +278,65 @@ static void execute(char *command) {
     while (*args && *args != ' ') ++args;
     if (*args) *args++ = 0;
     while (*args == ' ') ++args;
-    if (equal(command, "help")) help();
-    else if (equal(command, "clear")) terminal_clear();
-    else if (equal(command, "about") || equal(command, "version"))
-        print("Cobalt OS 0.1.0 / i386\nFASM BIOS loader + freestanding C kernel.\n"
+    if (!strcmp(command, "help")) help();
+    else if (!strcmp(command, "clear")) terminal_clear();
+    else if (!strcmp(command, "games"))
+        print("C game ports: 2048 (Gabriele Cirulli), pong (Jake Gordon).\n"
+              "Type 2048 or pong. Arrows/WASD move, P pauses, R restarts, Esc exits.\n");
+    else if (!strcmp(command, "2048") || !strcmp(command, "pong")) {
+        current_game = !strcmp(command, "2048") ? GAME_2048 : GAME_PONG;
+        game_active = 1; game_paused = game_suspended = 0;
+        games_start(current_game, ticks, ticks);
+        debug(current_game == GAME_2048 ? "GAME: 2048 started\n" : "GAME: pong started\n");
+        desktop_draw();
+    } else if (!strcmp(command, "about") || !strcmp(command, "version"))
+        print("Cobalt OS 0.2.0 / i386\nFASM BIOS loader + freestanding C kernel/libc.\n"
               "800x600 graphics, PS/2 input, single address space.\n");
-    else if (equal(command, "echo")) { print(args); put('\n'); }
-    else if (equal(command, "uptime")) { number(ticks / 100); print(" seconds since boot\n"); }
-    else if (equal(command, "date")) date();
-    else if (equal(command, "mem")) {
+    else if (!strcmp(command, "echo")) { print(args); put('\n'); }
+    else if (!strcmp(command, "uptime")) { number(ticks / 100); print(" seconds since boot\n"); }
+    else if (!strcmp(command, "date")) date();
+    else if (!strcmp(command, "mem")) {
         print("Kernel + static data: "); number((uint32_t)__bss_end - 0x10000); print(" bytes\n");
         print("Kernel base: 0x10000. Stack top: 0x90000.\nNo heap; no RAM capacity probe.\n");
-    } else if (equal(command, "ls")) {
+    } else if (!strcmp(command, "ls")) {
         for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
-            print(files[i].name); print("  "); number((uint32_t)length(files[i].contents)); print(" bytes (ROM)\n");
+            print(files[i].name); print("  "); number((uint32_t)strlen(files[i].contents)); print(" bytes (ROM)\n");
         }
-    } else if (equal(command, "cat")) {
+    } else if (!strcmp(command, "cat")) {
         unsigned i;
         for (i = 0; i < sizeof(files) / sizeof(files[0]); ++i)
-            if (equal(args, files[i].name)) { print(files[i].contents); break; }
+            if (!strcmp(args, files[i].name)) { print(files[i].contents); break; }
         if (i == sizeof(files) / sizeof(files[0])) print("File not found; use ls (names are case-sensitive).\n");
-    } else if (equal(command, "color")) {
-        if (equal(args, "white")) foreground = INK;
-        else if (equal(args, "green")) foreground = ACCENT;
-        else if (equal(args, "amber")) foreground = 0xf3cd83;
+    } else if (!strcmp(command, "color")) {
+        if (!strcmp(args, "white")) foreground = INK;
+        else if (!strcmp(args, "green")) foreground = ACCENT;
+        else if (!strcmp(args, "amber")) foreground = 0xf3cd83;
         else print("Usage: color white|green|amber\n");
-    } else if (equal(command, "history")) {
+    } else if (!strcmp(command, "history")) {
         for (unsigned i = 0; i < history_count; ++i) {
             print(history[(history_next + 8 - history_count + i) % 8]); put('\n');
         }
-    } else if (equal(command, "reboot")) {
+    } else if (!strcmp(command, "reboot")) {
         print("Rebooting...\n"); terminal_draw();
         if (controller_wait(0)) outb(0x64, 0xfe);
         stop();
-    } else if (equal(command, "shutdown")) {
+    } else if (!strcmp(command, "shutdown")) {
         print("Powering off (QEMU ACPI)...\n"); terminal_draw();
         __asm__ volatile ("outw %0,%1" : : "a"((uint16_t)0x2000), "Nd"((uint16_t)0x604));
         print("Power-off unsupported on this machine. CPU halted.\n"); terminal_draw(); stop();
-    } else if (equal(command, "halt")) {
+    } else if (!strcmp(command, "halt")) {
         print("CPU halted. Reset the machine to continue.\n"); terminal_draw(); stop();
     } else { print("Unknown command: "); print(command); print(" (try help)\n"); }
 }
 static void input_replace(const char *s) {
     while (input_length) { --input_length; --column; lines[row][column] = ' '; }
-    copy(input, s); input_length = (unsigned)length(input);
+    strcpy(input, s); input_length = (unsigned)strlen(input);
     for (unsigned i = 0; i < input_length; ++i) put(input[i]);
 }
 static void submit(void) {
     input[input_length] = 0;
     if (input_length) {
-        copy(history[history_next], input);
+        strcpy(history[history_next], input);
         history_next = (history_next + 1) % 8;
         if (history_count < 8) ++history_count;
     }
@@ -333,8 +359,11 @@ static const char shifted[128] = {
 };
 static void keyboard(uint8_t scan) {
     static unsigned shift, control, caps, extended;
+    static uint8_t held[128];
     if (scan == 0xe0) { extended = 1; return; }
     unsigned code = scan & 0x7f, released = scan & 0x80, ext = extended;
+    int repeated = held[code];
+    held[code] = !released;
     extended = 0;
     if (!ext && (code == 42 || code == 54)) {
         unsigned bit = code == 42 ? 1 : 2;
@@ -342,12 +371,35 @@ static void keyboard(uint8_t scan) {
         return;
     }
     if (code == 29) { control = !released; return; }
+    if (game_active) {
+        if (!visible && !released) return;
+        int direction = -1;
+        if ((ext && code == 72) || (!ext && code == 17)) direction = GAME_UP;
+        if ((ext && code == 77) || (!ext && code == 32)) direction = GAME_RIGHT;
+        if ((ext && code == 80) || (!ext && code == 31)) direction = GAME_DOWN;
+        if ((ext && code == 75) || (!ext && code == 30)) direction = GAME_LEFT;
+        if (direction >= 0) games_key((enum game_key)direction, !released);
+        else if (!ext && !released && !repeated) {
+            if (code == 1) {
+                game_active = game_paused = game_suspended = 0;
+                debug("GAME: returned to terminal\n"); desktop_draw(); return;
+            } else if (code == 19) {
+                games_start(current_game, ticks, ticks); game_paused = 0;
+                debug("GAME: restarted\n");
+            } else if (code == 25) {
+                games_key(GAME_PAUSE, 1); game_paused = !game_paused;
+                debug(game_paused ? "GAME: paused\n" : "GAME: resumed\n");
+            }
+        }
+        if (visible) terminal_draw();
+        return;
+    }
     if (released) return;
     if (!ext && code == 58) { caps ^= 1; return; }
     if (!visible) return;
     if (ext && (code == 72 || code == 80)) {
         if (code == 72 && history_offset < history_count) {
-            if (!history_offset) copy(draft, input);
+            if (!history_offset) strcpy(draft, input);
             ++history_offset;
         } else if (code == 80 && history_offset) --history_offset;
         else return;
@@ -393,12 +445,12 @@ static void mouse(uint8_t byte) {
     int redraw = 0;
     if (pressed && !left) {
         if (mouse_y >= 568 && mouse_y < 592 && mouse_x >= 16 && mouse_x < 160) {
-            visible = !visible; redraw = 1;
+            window_visibility(!visible); redraw = 1;
             debug(visible ? "GUI: terminal restored\n" : "GUI: terminal minimized\n");
         } else if (visible && mouse_y >= window_y && mouse_y < window_y + 32 &&
                    mouse_x >= window_x && mouse_x < window_x + 736) {
             if (mouse_x >= window_x + 692) {
-                visible = 0; redraw = 1; debug("GUI: terminal minimized\n");
+                window_visibility(0); redraw = 1; debug("GUI: terminal minimized\n");
             } else { dragging = 1; drag_x = mouse_x - window_x; drag_y = mouse_y - window_y; }
         }
     }
@@ -421,10 +473,10 @@ void kmain(void) {
     timer_init();
     input_init();
     terminal_clear();
-    print("Cobalt OS 0.1.0\n"
+    print("Cobalt OS 0.2.0\n"
           "------------------------------------------------------------\n"
           "Welcome to your C + FASM operating system.\n"
-          "Type help for commands; use the mouse to move this window.\n\n");
+          "Type help for commands, games for ports; drag this window to move it.\n\n");
     prompt(); desktop_draw(); cursor_show();
     debug("\nCOBALT READY\n");
     uint32_t last_blink = ticks, last_second = ticks / 100;
@@ -439,10 +491,13 @@ void kmain(void) {
             cursor_show();
         }
         uint32_t now = ticks;
+        if (game_active && games_tick(now) && visible) {
+            cursor_hide(); terminal_draw(); cursor_show();
+        }
         if (now - last_blink >= 50) {
             last_blink = now; caret_on = !caret_on;
             cursor_hide();
-            if (visible) {
+            if (visible && !game_active) {
                 rect(window_x + 16 + (int)column * 8, window_y + 57 + (int)row * 16,
                      8, 2, caret_on ? ACCENT : TERM);
             }

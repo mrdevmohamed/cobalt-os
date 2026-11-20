@@ -103,6 +103,9 @@ def main():
                 result = png_from_ppm(ppm, BUILD / f"{name}.png")
                 ppm.unlink()
                 return result
+            def client(pixels):
+                return b"".join(pixels[(y * 800 + 48) * 3:(y * 800 + 752) * 3]
+                                for y in range(116, 484))
 
             await_log("COBALT READY")
             width, height, pixels = screenshot("desktop")
@@ -130,6 +133,41 @@ def main():
             for _ in range(79): key("backspace")
             command("echo boundary-ok"); await_log("boundary-ok\ncobalt> ")
             key("l", ("ctrl",)); command("about"); command("help")
+            command("games"); await_log("C game ports: 2048")
+            command("2048"); await_log("GAME: 2048 started")
+            initial = client(screenshot("2048-start")[2])
+            key("left")
+            moved = client(screenshot("2048-left")[2]) != initial
+            key("right")
+            moved |= client(screenshot("2048")[2]) != initial
+            assert moved, "2048 arrows did not change tiles"
+            key("p"); await_log("GAME: paused")
+            paused = client(screenshot("2048-paused")[2])
+            key("right"); time.sleep(0.6)
+            assert client(screenshot("2048-still-paused")[2]) == paused
+            key("p"); await_log("GAME: resumed")
+            key("r"); await_log("GAME: restarted")
+            key("esc"); await_log("GAME: returned to terminal")
+            command("echo after-2048"); await_log("after-2048\ncobalt> ")
+            command("pong"); await_log("GAME: pong started")
+            initial = client(screenshot("pong-start")[2])
+            # A new serve intentionally waits 75 guest ticks before ball motion.
+            time.sleep(1.0)
+            assert client(screenshot("pong")[2]) != initial, "Pong timer did not animate"
+            key("p")
+            paused = client(screenshot("pong-paused")[2])
+            time.sleep(0.6)
+            assert client(screenshot("pong-still-paused")[2]) == paused
+            # Minimize/restore must preserve a manually paused game's state.
+            relative(-600, 80); button(True); button(False)
+            time.sleep(0.2)
+            button(True); button(False)
+            assert client(screenshot("pong-restored")[2]) == paused
+            relative(600, -80)
+            key("p"); time.sleep(0.3)
+            assert client(screenshot("pong-resumed")[2]) != paused
+            key("esc")
+            command("echo after-pong"); await_log("after-pong\ncobalt> ")
             # The PS/2 cursor starts at (680, 500). Minimize and restore by taskbar.
             relative(-600, 80)
             button(True); button(False); await_log("GUI: terminal minimized")
@@ -144,8 +182,9 @@ def main():
             process.wait(timeout=10)
             assert process.returncode == 0
             print("PASS: BIOS boot, 800x600 GUI, shell, editing boundary, history, ROM files,")
-            print("      RTC, uptime, mouse minimize/restore/drag, and QEMU shutdown.")
-            print("Screenshots: build/desktop.png, build/minimized.png, build/smoke.png")
+            print("      RTC, uptime, 2048/Pong gameplay, pause/restart/exit, game minimize/restore,")
+            print("      mouse minimize/restore/drag, and QEMU shutdown.")
+            print("Screenshots: build/desktop.png, build/2048.png, build/pong.png, build/smoke.png")
         finally:
             connection.close()
             if process.poll() is None:

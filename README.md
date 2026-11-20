@@ -12,7 +12,7 @@ make
 make run
 ```
 
-Run these commands from this directory. GCC must support compiling freestanding i386 objects with `-m32`; the build does not link libc or require 32-bit libc development files.
+Run these commands from this directory. GCC must support compiling freestanding i386 objects with `-m32`; the build links the included `build/libc.a`, not the host libc, and does not require 32-bit libc development files.
 
 `build/cobalt.img` is a 1.44 MB bootable **floppy disk image**, not an ISO. `make run` boots it with QEMU's standard VGA and 32 MB RAM. QEMU emulates BIOS, VGA, and a PS/2 keyboard/mouse. Do not write the image to a physical drive: physical hardware compatibility has not been established.
 
@@ -46,19 +46,53 @@ The graphical QEMU window accepts keyboard input. QEMU may capture the mouse; **
 | `cat COMMANDS.TXT` | Read command reference |
 | `color white` | Set terminal text color; also `green` or `amber` |
 | `history` | List the eight most recent submitted commands |
+| `games` | List the included game ports and controls |
+| `2048` | Launch the graphical 2048 puzzle |
+| `pong` | Launch graphical single-player Pong against the computer |
 | `reboot` | Reset through the PS/2 controller |
 | `shutdown` | Power off through QEMU's ACPI port; otherwise halt |
 | `halt` | Stop the CPU until the machine is reset |
 
 Commands are case-sensitive. There is no quoting, piping, executable loading, or host-shell execution.
 
+## Games
+
+Two upstream browser games have been adapted to freestanding C and the OS framebuffer:
+
+- **2048**, based on [Gabriele Cirulli's implementation](https://github.com/gabrielecirulli/2048): slide and merge equal tiles, earn points, and reach 2048.
+- **Pong**, based on [Jake Gordon's implementation](https://github.com/jakesgordon/javascript-pong): control the left paddle against a computer opponent; first to seven points wins.
+
+Launch with `2048` or `pong` in the terminal. **Arrows/WASD** move; Pong uses Up/Down or W/S. **P** pauses, **R** starts a new game, and **Esc** returns to the existing terminal. Minimizing pauses the game; restoring resumes only if it was not already manually paused. The terminal's movable window hosts the game instead of a separate overlapping window.
+
+The ports use integer arithmetic, fixed-capacity state, and the existing 100 Hz hardware timer. They have no browser dependencies, sound, saved scores, or persistent sessions. Their MIT notices are retained in `games/LICENSE-2048` and `games/LICENSE-PONG`.
+
+2048 continues beyond the win tile, caps individual tiles at 1,048,576, and saturates the score at `UINT32_MAX`. Pong briefly waits before each serve and caps timer catch-up after stalls. Pausing releases held paddle controls; press the movement key again after resuming.
+
+## Freestanding libc
+
+`libc/include` supplies standard-named C headers; `build/libc.a` is built from the local C sources and linked into the kernel and games. This is a **subset**, not a complete ISO C or POSIX library:
+
+| Header | Available functions |
+| --- | --- |
+| `string.h` | `memcpy`, `memmove`, `memset`, `memcmp`, `strlen`, `strcmp`, `strncmp`, `strcpy`, `strchr` |
+| `stdlib.h` | `rand`, `srand`, `abs` |
+| `stdio.h` | `snprintf`, `vsnprintf` |
+
+Formatting supports `%%`, `%s`, `%c`, `%d`, `%i`, `%u`, `%x`, `%X`, minimum field widths, and numeric zero-padding. No floating-point formats, precision, or length modifiers. Bounded formatting returns the length that would have been written and terminates the output when capacity is nonzero. An unsupported directive or width exceeding `INT_MAX` stops formatting, retains the terminated prefix, and returns `-1`; output length overflow also returns `-1`. No `errno` is set. Random numbers are deterministic and not cryptographically secure. As in standard C, `abs(INT_MIN)` is outside the supported domain.
+
+There is no `malloc`, host-file I/O, process API, or full `printf` stream implementation. The terminal renderer remains the kernel's output device. GCC supplies the freestanding compiler headers such as `stdint.h`, `stddef.h`, and `stdarg.h`.
+
 ## Verification
 
 ```sh
-make smoke
+make check
 ```
 
 The Python-standard-library-only smoke scenario boots the actual image in headless QEMU, sends emulated keyboard and mouse input through QMP, checks shell output on debug port `0xe9`, captures the framebuffer, and exercises shutdown. It covers editing at the input boundary, command history/drafts, ROM reads and missing-file errors, command errors, the RTC and timer, and minimizing/restoring/dragging the terminal.
+
+`make check` also runs native deterministic libc and game-rule tests. The QEMU scenario exercises both game launch commands, tile movement, Pong animation, pause stability across timer ticks, restart/exit, and game minimize/restore. Screenshots include `build/2048.png` and `build/pong.png`. `make smoke` runs the QEMU scenario alone.
+
+The libc and game-rule executables and the complete QEMU interaction scenario passed for this version. The scenario verifies the real framebuffer and guest input path, including a stable paused game across minimize/restore; it does not establish physical hardware compatibility.
 
 Smoke runs use QEMU's disposable `-snapshot` disk overlay, leaving the base image unchanged and allowing verification alongside an already-running instance.
 
@@ -80,6 +114,11 @@ boot/loader.asm     Disk loading, VBE setup, font copy, protected-mode transitio
 boot/entry.asm      C entry, BSS clearing, timer and fatal interrupt stubs
 kernel/kernel.c    Hardware I/O, graphics, PS/2 input, desktop, terminal, shell
 kernel/linker.ld   Fixed-address i386 memory layout
+libc/include/      Freestanding string, stdlib, and bounded-formatting headers
+libc/              C implementations, archived as build/libc.a
+games/games.c      Integer-only 2048 and Pong ports, rendering, game rules
+games/games.h      Kernel-facing input/timer/canvas interface
+tests/             Deterministic host-side libc and game-rule checks
 scripts/smoke.py   End-to-end QEMU interaction scenario
 ```
 
